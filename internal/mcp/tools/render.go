@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"cloud.google.com/go/storage" // Added for GCS client
 	"github.com/Masterminds/sprig/v3"
 	// "github.com/pkg/browser" // No longer needed
 
@@ -23,8 +24,8 @@ import (
 )
 
 const (
-	gcsBucketName = "canyon-bucket" // As specified by user
-	gcsPathPrefix = "canyon-renders" // As specified by user
+	gcsBucketName = "canyon-demo-html-renders" // Updated bucket name
+	gcsPathPrefix = "canyon-renders"           // As specified by user
 	gcsBaseURL    = "https://storage.googleapis.com"
 )
 
@@ -95,43 +96,51 @@ func generateRandomFilename() string {
 	return fmt.Sprintf("%s-%s.html", wordsPart, digits)
 }
 
-// renderAndUploadToGCS takes the rendered HTML buffer, uploads it to GCS, and returns the public URL.
+// renderAndUploadToGCS takes the rendered HTML buffer, uploads it to GCS using the Go client,
+// and returns a signed URL for temporary access.
 func renderAndUploadToGCS(ctx context.Context, buffer *bytes.Buffer) (string, error) {
-	// 1. Create temporary file
-	tmpFile, err := os.CreateTemp("", "canyon-render-*.html")
+	// 1. Initialize GCS client
+	client, err := storage.NewClient(ctx)
 	if err != nil {
-		return "", fmt.Errorf("failed to create temporary file: %w", err)
+		return "", fmt.Errorf("failed to create GCS client: %w", err)
 	}
-	defer os.Remove(tmpFile.Name()) // Clean up the temp file
+	defer client.Close()
 
-	// 2. Write buffer to temporary file
-	if _, err := tmpFile.Write(buffer.Bytes()); err != nil {
-		tmpFile.Close() // Close file before attempting remove on error path
-		return "", fmt.Errorf("failed to write to temporary file: %w", err)
-	}
-	if err := tmpFile.Close(); err != nil {
-		return "", fmt.Errorf("failed to close temporary file: %w", err)
-	}
-
-	// 3. Generate filename and GCS path
+	// 2. Generate filename and object path
 	filename := generateRandomFilename()
-	gcsPath := fmt.Sprintf("gs://%s/%s/%s", gcsBucketName, gcsPathPrefix, filename)
+	objectPath := fmt.Sprintf("%s/%s", gcsPathPrefix, filename) // Path within the bucket
 
-	// 4. Upload using gcloud command
-	// Ensure gcloud is in PATH and authenticated
-	cmd := exec.CommandContext(ctx, "gcloud", "storage", "cp", tmpFile.Name(), gcsPath)
-	slog.Info("Executing gcloud command", slog.String("command", cmd.String()))
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		slog.Error("gcloud command failed", slog.String("output", string(output)), slog.Any("err", err))
-		return "", fmt.Errorf("failed to upload to GCS using gcloud: %w. Output: %s", err, string(output))
+	// 3. Get bucket handle and object handle
+	bucket := client.Bucket(gcsBucketName)
+	obj := bucket.Object(objectPath)
+
+	// 4. Upload the content using a Writer
+	wc := obj.NewWriter(ctx)
+	wc.ContentType = "text/html" // Set content type for proper browser rendering
+	// Consider adding Cache-Control headers if needed: wc.CacheControl = "public, max-age=..."
+
+	if _, err = wc.Write(buffer.Bytes()); err != nil {
+		return "", fmt.Errorf("failed to write data to GCS object writer: %w", err)
 	}
-	slog.Info("gcloud command successful", slog.String("output", string(output)))
+	if err := wc.Close(); err != nil {
+		return "", fmt.Errorf("failed to close GCS object writer: %w", err)
+	}
+	slog.Info("Successfully uploaded to GCS", slog.String("bucket", gcsBucketName), slog.String("object", objectPath))
 
-	// 5. Construct public URL
-	publicURL := fmt.Sprintf("%s/%s/%s/%s", gcsBaseURL, gcsBucketName, gcsPathPrefix, filename)
+	// 5. Generate a signed URL (valid for 15 minutes)
+	opts := &storage.SignedURLOptions{
+		Scheme:  storage.SigningSchemeV4,
+		Method:  "GET",
+		Expires: time.Now().Add(15 * time.Minute),
+	}
 
-	return publicURL, nil
+	signedURL, err := client.Bucket(gcsBucketName).SignedURL(objectPath, opts)
+	if err != nil {
+		return "", fmt.Errorf("failed to generate signed URL: %w", err)
+	}
+	slog.Info("Generated signed URL", slog.String("url", signedURL)) // Log the URL for debugging if needed
+
+	return signedURL, nil
 }
 
 // NewRenderCSVAsTable renders csv as a table and uploads to GCS.
