@@ -9,15 +9,33 @@ import (
 	"fmt"
 	"html/template"
 	"log/slog"
+	"math/rand"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/Masterminds/sprig/v3"
-	"github.com/pkg/browser"
+	// "github.com/pkg/browser" // No longer needed
 
 	"github.com/humanitec/canyon-cli/internal/mcp"
 )
+
+const (
+	gcsBucketName = "canyon-bucket" // As specified by user
+	gcsPathPrefix = "canyon-renders" // As specified by user
+	gcsBaseURL    = "https://storage.googleapis.com"
+)
+
+// Simple word list for random filenames
+var randomWords = []string{
+	"apple", "banana", "cherry", "date", "elderberry", "fig", "grape", "honeydew",
+	"kiwi", "lemon", "mango", "nectarine", "orange", "papaya", "quince", "raspberry",
+	"strawberry", "tangerine", "ugli", "vanilla", "watermelon", "xigua", "yam", "zucchini",
+	"red", "green", "blue", "yellow", "purple", "orange", "pink", "brown", "black", "white",
+	"happy", "sad", "big", "small", "fast", "slow", "bright", "dark", "shiny", "dull",
+}
 
 //go:embed render_csv.html.tmpl
 var renderCsvTemplate string
@@ -31,6 +49,8 @@ var renderGraphTemplate string
 var funcMap template.FuncMap
 
 func init() {
+	// Seed random number generator
+	rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	f := func(path string, defaultContent string) string {
 		raw, err := os.ReadFile(path)
@@ -58,15 +78,71 @@ func init() {
 	}
 }
 
-// NewRenderCSVAsTable renders csv as a table.
+// generateRandomFilename creates a filename like "word1-word2-word3-12345.html"
+func generateRandomFilename() string {
+	n := len(randomWords)
+	wordsPart := fmt.Sprintf("%d", time.Now().UnixNano()) // Fallback if word list is empty
+	if n > 0 {
+		word1 := randomWords[rand.Intn(n)]
+		word2 := randomWords[rand.Intn(n)]
+		word3 := randomWords[rand.Intn(n)]
+		wordsPart = fmt.Sprintf("%s-%s-%s", word1, word2, word3)
+	}
+
+	// Generate 5 random digits
+	digits := fmt.Sprintf("%05d", rand.Intn(100000)) // Generates a number between 0 and 99999, pads with leading zeros if needed
+
+	return fmt.Sprintf("%s-%s.html", wordsPart, digits)
+}
+
+// renderAndUploadToGCS takes the rendered HTML buffer, uploads it to GCS, and returns the public URL.
+func renderAndUploadToGCS(ctx context.Context, buffer *bytes.Buffer) (string, error) {
+	// 1. Create temporary file
+	tmpFile, err := os.CreateTemp("", "canyon-render-*.html")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temporary file: %w", err)
+	}
+	defer os.Remove(tmpFile.Name()) // Clean up the temp file
+
+	// 2. Write buffer to temporary file
+	if _, err := tmpFile.Write(buffer.Bytes()); err != nil {
+		tmpFile.Close() // Close file before attempting remove on error path
+		return "", fmt.Errorf("failed to write to temporary file: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return "", fmt.Errorf("failed to close temporary file: %w", err)
+	}
+
+	// 3. Generate filename and GCS path
+	filename := generateRandomFilename()
+	gcsPath := fmt.Sprintf("gs://%s/%s/%s", gcsBucketName, gcsPathPrefix, filename)
+
+	// 4. Upload using gcloud command
+	// Ensure gcloud is in PATH and authenticated
+	cmd := exec.CommandContext(ctx, "gcloud", "storage", "cp", tmpFile.Name(), gcsPath)
+	slog.Info("Executing gcloud command", slog.String("command", cmd.String()))
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		slog.Error("gcloud command failed", slog.String("output", string(output)), slog.Any("err", err))
+		return "", fmt.Errorf("failed to upload to GCS using gcloud: %w. Output: %s", err, string(output))
+	}
+	slog.Info("gcloud command successful", slog.String("output", string(output)))
+
+	// 5. Construct public URL
+	publicURL := fmt.Sprintf("%s/%s/%s/%s", gcsBaseURL, gcsBucketName, gcsPathPrefix, filename)
+
+	return publicURL, nil
+}
+
+// NewRenderCSVAsTable renders csv as a table and uploads to GCS.
 func NewRenderCSVAsTable() mcp.Tool {
 	tmpl, err := template.New("").Funcs(funcMap).Parse(renderCsvTemplate)
 	if err != nil {
 		panic(err)
 	}
 	return mcp.Tool{
-		Name:        "render_csv_as_table_in_browser",
-		Description: `This tool can be used to render CSV data as a pretty html table in the users browser`,
+		Name:        "render_csv_as_table_to_gcs",
+		Description: `This tool renders CSV data as an HTML table and uploads it to Google Cloud Storage, returning a public link.`,
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -76,33 +152,39 @@ func NewRenderCSVAsTable() mcp.Tool {
 			"required": []interface{}{"raw"},
 		},
 		Callable: func(ctx context.Context, arguments map[string]interface{}) ([]mcp.CallToolResponseContent, error) {
+			// Validate CSV input
 			r := csv.NewReader(strings.NewReader(arguments["raw"].(string)))
-			_, err := r.ReadAll()
-			if err != nil {
-				return nil, fmt.Errorf("invalid csv content")
+			if _, err := r.ReadAll(); err != nil {
+				return nil, fmt.Errorf("invalid csv content: %w", err)
 			}
+
+			// Render template to buffer
 			buffer := new(bytes.Buffer)
 			if err := tmpl.Execute(buffer, arguments); err != nil {
-				slog.Error("failed to execute template", slog.Any("err", err))
-				return nil, fmt.Errorf("could not render html content")
+				slog.Error("failed to execute csv template", slog.Any("err", err))
+				return nil, fmt.Errorf("could not render csv html content: %w", err)
 			}
-			if err := browser.OpenReader(bytes.NewReader(buffer.Bytes())); err != nil {
-				return nil, err
+
+			// Upload and get URL
+			publicURL, err := renderAndUploadToGCS(ctx, buffer)
+			if err != nil {
+				return nil, err // Error already contains details
 			}
-			return []mcp.CallToolResponseContent{mcp.NewTextToolResponseContent("browser was opened")}, nil
+
+			return []mcp.CallToolResponseContent{mcp.NewTextToolResponseContent(fmt.Sprintf("CSV rendered and uploaded: %s", publicURL))}, nil
 		},
 	}
 }
 
-// NewRenderTreeAsTree renders a hierarchy as basic html. Use https://d3js.org/d3-hierarchy/hierarchy instead in the future.
+// NewRenderTreeAsTree renders a hierarchy and uploads to GCS.
 func NewRenderTreeAsTree() mcp.Tool {
 	tmpl, err := template.New("").Funcs(funcMap).Parse(renderTreeTemplate)
 	if err != nil {
 		panic(err)
 	}
 	return mcp.Tool{
-		Name:        "render_data_as_tree_in_browser",
-		Description: `This tool will render a hierarchy such as a tree structure or directory tree in a user friendly way in the browser.`,
+		Name:        "render_data_as_tree_to_gcs",
+		Description: `This tool renders hierarchical data (like a tree structure) as HTML and uploads it to Google Cloud Storage, returning a public link.`,
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -111,7 +193,7 @@ func NewRenderTreeAsTree() mcp.Tool {
 			"required": []interface{}{"root"},
 			"$defs": map[string]interface{}{
 				"node": map[string]interface{}{
-					"type":        "object",
+					"type": "object",
 					"description": "A node in the tree structure",
 					"properties": map[string]interface{}{
 						"name":     map[string]interface{}{"type": "string", "description": "The name of the node"},
@@ -124,30 +206,33 @@ func NewRenderTreeAsTree() mcp.Tool {
 			},
 		},
 		Callable: func(ctx context.Context, arguments map[string]interface{}) ([]mcp.CallToolResponseContent, error) {
-			root, _ := arguments["root"].(map[string]interface{})
+			// Render template to buffer
 			buffer := new(bytes.Buffer)
-			if err := tmpl.Execute(buffer, map[string]interface{}{
-				"root": root,
-			}); err != nil {
-				slog.Error("failed to execute template", slog.Any("err", err))
-				return nil, fmt.Errorf("could not render html content")
+			if err := tmpl.Execute(buffer, arguments); err != nil { // Pass arguments directly
+				slog.Error("failed to execute tree template", slog.Any("err", err))
+				return nil, fmt.Errorf("could not render tree html content: %w", err)
 			}
-			if err := browser.OpenReader(bytes.NewReader(buffer.Bytes())); err != nil {
-				return nil, err
+
+			// Upload and get URL
+			publicURL, err := renderAndUploadToGCS(ctx, buffer)
+			if err != nil {
+				return nil, err // Error already contains details
 			}
-			return []mcp.CallToolResponseContent{mcp.NewTextToolResponseContent("browser was opened")}, nil
+
+			return []mcp.CallToolResponseContent{mcp.NewTextToolResponseContent(fmt.Sprintf("Tree rendered and uploaded: %s", publicURL))}, nil
 		},
 	}
 }
 
+// NewRenderNetworkAsGraph renders a network graph and uploads to GCS.
 func NewRenderNetworkAsGraph() mcp.Tool {
 	tmpl, err := template.New("").Funcs(funcMap).Parse(renderGraphTemplate)
 	if err != nil {
 		panic(err)
 	}
 	return mcp.Tool{
-		Name:        "render_network_as_graph_in_browser",
-		Description: `This tool will render an interconnected network as a force directed graph in the browser. Use this to present relationships between entities in a visual way which may be easier than text for users to consume.`,
+		Name:        "render_network_as_graph_to_gcs",
+		Description: `This tool renders an interconnected network as a force-directed graph in HTML and uploads it to Google Cloud Storage, returning a public link.`,
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -175,15 +260,20 @@ func NewRenderNetworkAsGraph() mcp.Tool {
 			"required": []interface{}{"nodes", "links"},
 		},
 		Callable: func(ctx context.Context, arguments map[string]interface{}) ([]mcp.CallToolResponseContent, error) {
+			// Render template to buffer
 			buffer := new(bytes.Buffer)
 			if err := tmpl.Execute(buffer, arguments); err != nil {
-				slog.Error("failed to execute template", slog.Any("err", err))
-				return nil, fmt.Errorf("could not render html content")
+				slog.Error("failed to execute graph template", slog.Any("err", err))
+				return nil, fmt.Errorf("could not render graph html content: %w", err)
 			}
-			if err := browser.OpenReader(bytes.NewReader(buffer.Bytes())); err != nil {
-				return nil, err
+
+			// Upload and get URL
+			publicURL, err := renderAndUploadToGCS(ctx, buffer)
+			if err != nil {
+				return nil, err // Error already contains details
 			}
-			return []mcp.CallToolResponseContent{mcp.NewTextToolResponseContent("browser was opened")}, nil
+
+			return []mcp.CallToolResponseContent{mcp.NewTextToolResponseContent(fmt.Sprintf("Graph rendered and uploaded: %s", publicURL))}, nil
 		},
 	}
 }
