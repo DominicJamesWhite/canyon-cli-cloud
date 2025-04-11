@@ -1,27 +1,14 @@
-# canyon-cli
+# canyon-cli-cloud
 
 This CLI is publically available for reference use in ongoing demos and feedback initiatives.
 
-## Installation
+Instead of generating the graph and opening a browser window, this creates the graph in a GCP bucket and shares the link.
 
-1. Download the latest version of the canyon-cli MCP tool from https://github.com/humanitec/canyon-cli/releases/.
-
-2. Then execute the `install` command in the terminal: `canyon install`. This will return the JSON configuration to add to your IDE or LLM  client and will ensure the binary is executable. If security warnings pop up, you should allow or accept the binary to run.
-
-3. Also make sure you have `humctl` installed with access to an org, hopefully the `canyon-demo` one for best results.
-
-## Development
-
-You can execute any of the CLI tools by running:
-
-```
-$ canyon rpc -s name=tools/list
-$ canyon rpc -s name=tools/call -s arguments='{ ... }'
-```
+Requires an authenticated gcloud cli install with storage APIs enabled.
 
 ### Developing the render templates
 
-If you're working on the HTML rendering templates, the templates are stored as the `.html.tmpl` files in the binary. 
+If you're working on the HTML rendering templates, the templates are stored as the `.html.tmpl` files in the binary.
 
 However, it will fall back, at runtime, to the files in:
 
@@ -102,7 +89,7 @@ canyon rpc tools/call --stdin <<"EOF"
         "class": "env",
       }
     ],
-    "links": [ 
+    "links": [
       {"source": "my-org", "target": "my-app"},
       {"source": "my-app", "target": "env-1"},
       {"source": "my-app", "target": "env-2"}
