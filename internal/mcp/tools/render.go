@@ -179,7 +179,7 @@ func NewRenderCSVAsTable() mcp.Tool {
 				return nil, err // Error already contains details
 			}
 
-			return []mcp.CallToolResponseContent{mcp.NewTextToolResponseContent(fmt.Sprintf("CSV rendered and uploaded: %s", publicURL))}, nil
+			return []mcp.CallToolResponseContent{mcp.NewTextToolResponseContent("CSV rendered and uploaded: " + publicURL)}, nil
 		},
 	}
 }
@@ -227,7 +227,7 @@ func NewRenderTreeAsTree() mcp.Tool {
 				return nil, err // Error already contains details
 			}
 
-			return []mcp.CallToolResponseContent{mcp.NewTextToolResponseContent(fmt.Sprintf("Tree rendered and uploaded: %s", publicURL))}, nil
+			return []mcp.CallToolResponseContent{mcp.NewTextToolResponseContent("Tree rendered and uploaded: " + publicURL)}, nil
 		},
 	}
 }
@@ -281,7 +281,7 @@ func NewRenderNetworkAsGraph() mcp.Tool {
 				return nil, err // Error already contains details
 			}
 
-			return []mcp.CallToolResponseContent{mcp.NewTextToolResponseContent(fmt.Sprintf("Graph rendered and uploaded: %s", publicURL))}, nil
+			return []mcp.CallToolResponseContent{mcp.NewTextToolResponseContent("Graph rendered and uploaded: " + publicURL)}, nil
 		},
 	}
 }
