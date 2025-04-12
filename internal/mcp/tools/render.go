@@ -128,12 +128,12 @@ func renderAndUploadToGCS(ctx context.Context, buffer *bytes.Buffer) (string, er
 
 	// 5. Generate a signed URL (valid for 15 minutes)
 	// 5. Generate a signed URL (valid for 15 minutes)
-	// For V4 signing, required headers like 'host' are typically handled by the client library.
+	// Use VirtualHostedStyle to avoid potential "host" header issues with V4 signing.
 	opts := &storage.SignedURLOptions{
-		Scheme:  storage.SigningSchemeV4,
-		Method:  "GET",
-		Expires: time.Now().Add(15 * time.Minute),
-		// Headers: []string{"Host: storage.googleapis.com"}, // Removed: Let the client library handle default headers like Host.
+		Scheme:             storage.SigningSchemeV4,
+		Method:             "GET",
+		Expires:            time.Now().Add(15 * time.Minute),
+		VirtualHostedStyle: true, // Add this line
 	}
 
 	signedURL, err := client.Bucket(gcsBucketName).SignedURL(objectPath, opts)
