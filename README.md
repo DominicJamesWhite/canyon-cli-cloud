@@ -4,7 +4,7 @@ This CLI is publically available for reference use in ongoing demos and feedback
 
 Instead of generating the graph and opening a browser window, this creates the graph in a GCP bucket and shares the link.
 
-Requires an authenticated gcloud cli install with storage APIs enabled.
+Requires "MINIO_ENDPOINT", "MINIO_ACCESS_KEY_ID", "MINIO_SECRET_ACCESS_KEY", "MINIO_BUCKET", "MINIO_USE_SSL" env variables.
 
 My apologies to actual devs.
 
