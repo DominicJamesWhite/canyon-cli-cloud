@@ -14,18 +14,15 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"net/url" // Added for URL parsing/joining
+	"strconv" // Added for string conversion
 
-	"cloud.google.com/go/storage" // Added for GCS client
 	"github.com/Masterminds/sprig/v3"
+	"github.com/minio/minio-go/v7" // Added for Minio client
+	"github.com/minio/minio-go/v7/pkg/credentials" // Added for Minio credentials
 	// "github.com/pkg/browser" // No longer needed
 
 	"github.com/humanitec/canyon-cli/internal/mcp"
-)
-
-const (
-	gcsBucketName = "canyon-demo-html-renders" // Updated bucket name
-	gcsPathPrefix = "canyon-renders"           // As specified by user
-	gcsBaseURL    = "https://storage.googleapis.com"
 )
 
 // Simple word list for random filenames
@@ -95,65 +92,86 @@ func generateRandomFilename() string {
 	return fmt.Sprintf("%s-%s.html", wordsPart, digits)
 }
 
-// renderAndUploadToGCS takes the rendered HTML buffer, uploads it to GCS using the Go client,
-// and returns a signed URL for temporary access.
-func renderAndUploadToGCS(ctx context.Context, buffer *bytes.Buffer) (string, error) {
-	// 1. Initialize GCS client
-	client, err := storage.NewClient(ctx)
-	if err != nil {
-		return "", fmt.Errorf("failed to create GCS client: %w", err)
-	}
-	defer client.Close()
+// renderAndUploadToMinio takes the rendered HTML buffer, uploads it to Minio,
+// and returns a public URL. Configuration is read from environment variables.
+func renderAndUploadToMinio(ctx context.Context, buffer *bytes.Buffer) (string, error) {
+	// 1. Read configuration from environment variables
+	endpoint := os.Getenv("MINIO_ENDPOINT")
+	accessKeyID := os.Getenv("MINIO_ACCESS_KEY_ID")
+	secretAccessKey := os.Getenv("MINIO_SECRET_ACCESS_KEY")
+	bucketName := os.Getenv("MINIO_BUCKET")
+	useSSLStr := os.Getenv("MINIO_USE_SSL") // Expect "true" or "false"
 
-	// 2. Generate filename and object path
+	if endpoint == "" || accessKeyID == "" || secretAccessKey == "" || bucketName == "" {
+		return "", fmt.Errorf("missing required Minio environment variables (MINIO_ENDPOINT, MINIO_ACCESS_KEY_ID, MINIO_SECRET_ACCESS_KEY, MINIO_BUCKET)")
+	}
+
+	useSSL := true // Default to true if not specified or invalid
+	if useSSLStr != "" {
+		parsedSSL, err := strconv.ParseBool(useSSLStr)
+		if err == nil {
+			useSSL = parsedSSL
+		} else {
+			slog.Warn("Invalid MINIO_USE_SSL value, defaulting to true", slog.String("value", useSSLStr), slog.Any("error", err))
+		}
+	}
+
+	// Remove potential scheme (like https://) from endpoint for Minio client
+	endpointURL, err := url.Parse(endpoint)
+	if err != nil {
+		return "", fmt.Errorf("invalid MINIO_ENDPOINT format: %w", err)
+	}
+	minioEndpoint := endpointURL.Host // Use host:port
+
+	// 2. Initialize Minio client
+	minioClient, err := minio.New(minioEndpoint, &minio.Options{
+		Creds:  credentials.NewStaticV4(accessKeyID, secretAccessKey, ""),
+		Secure: useSSL,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to create Minio client: %w", err)
+	}
+
+	// 3. Generate filename (object name)
 	filename := generateRandomFilename()
-	objectPath := fmt.Sprintf("%s/%s", gcsPathPrefix, filename) // Path within the bucket
+	objectName := filename // Use filename directly as object name in Minio
 
-	// 3. Get bucket handle and object handle
-	bucket := client.Bucket(gcsBucketName)
-	obj := bucket.Object(objectPath)
-
-	// 4. Upload the content using a Writer
-	wc := obj.NewWriter(ctx)
-	wc.ContentType = "text/html" // Set content type for proper browser rendering
-	// Consider adding Cache-Control headers if needed: wc.CacheControl = "public, max-age=..."
-
-	if _, err = wc.Write(buffer.Bytes()); err != nil {
-		return "", fmt.Errorf("failed to write data to GCS object writer: %w", err)
-	}
-	if err := wc.Close(); err != nil {
-		return "", fmt.Errorf("failed to close GCS object writer: %w", err)
-	}
-	slog.Info("Successfully uploaded to GCS", slog.String("bucket", gcsBucketName), slog.String("object", objectPath))
-
-	// 5. Generate a signed URL (valid for 15 minutes)
-	// 5. Generate a signed URL (valid for 15 minutes)
-	// Use VirtualHostedStyle to avoid potential "host" header issues with V4 signing.
-	opts := &storage.SignedURLOptions{
-		Scheme:             storage.SigningSchemeV4,
-		Method:             "GET",
-		Expires:            time.Now().Add(15 * time.Minute),
-		VirtualHostedStyle: true, // Add this line
-	}
-
-	signedURL, err := client.Bucket(gcsBucketName).SignedURL(objectPath, opts)
+	// 4. Upload the content
+	// Use PutObject with buffer.Bytes() and buffer.Len()
+	uploadInfo, err := minioClient.PutObject(ctx, bucketName, objectName, buffer, int64(buffer.Len()), minio.PutObjectOptions{
+		ContentType: "text/html",
+		// Consider adding Cache-Control: CacheControl: "public, max-age=...",
+	})
 	if err != nil {
-		return "", fmt.Errorf("failed to generate signed URL: %w", err)
+		return "", fmt.Errorf("failed to upload object to Minio: %w", err)
 	}
-	slog.Info("Generated signed URL", slog.String("url", signedURL)) // Log the URL for debugging if needed
+	slog.Info("Successfully uploaded to Minio", slog.String("bucket", bucketName), slog.String("object", objectName), slog.Int64("size", uploadInfo.Size))
 
-	return signedURL, nil
+	// 5. Construct the public URL
+	// Ensure endpoint has scheme for proper URL construction
+	publicURL := fmt.Sprintf("%s/%s/%s", endpoint, bucketName, objectName)
+
+	// Validate and potentially clean up the URL (e.g., remove double slashes if endpoint already has trailing slash)
+	parsedPublicURL, err := url.Parse(publicURL)
+	if err != nil {
+		slog.Error("Failed to parse constructed public URL, returning raw string", slog.String("url", publicURL), slog.Any("error", err))
+		return publicURL, nil // Return best effort URL even if parsing fails
+	}
+	// Basic path cleaning
+	parsedPublicURL.Path = filepath.Join(parsedPublicURL.Path) // Should handle extra slashes
+
+	return parsedPublicURL.String(), nil
 }
 
-// NewRenderCSVAsTable renders csv as a table and uploads to GCS.
+// NewRenderCSVAsTable renders csv as a table and uploads to Minio.
 func NewRenderCSVAsTable() mcp.Tool {
 	tmpl, err := template.New("").Funcs(funcMap).Parse(renderCsvTemplate)
 	if err != nil {
 		panic(err)
 	}
 	return mcp.Tool{
-		Name:        "render_csv_as_table_to_gcs",
-		Description: `This tool renders CSV data as an HTML table and uploads it to Google Cloud Storage, returning a public link.`,
+		Name:        "render_csv_as_table_to_minio",
+		Description: `This tool renders CSV data as an HTML table and uploads it to Minio, returning a public link. Requires MINIO_* env vars to be set.`,
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -177,7 +195,7 @@ func NewRenderCSVAsTable() mcp.Tool {
 			}
 
 			// Upload and get URL
-			publicURL, err := renderAndUploadToGCS(ctx, buffer)
+			publicURL, err := renderAndUploadToMinio(ctx, buffer)
 			if err != nil {
 				return nil, err // Error already contains details
 			}
@@ -187,15 +205,15 @@ func NewRenderCSVAsTable() mcp.Tool {
 	}
 }
 
-// NewRenderTreeAsTree renders a hierarchy and uploads to GCS.
+// NewRenderTreeAsTree renders a hierarchy and uploads to Minio.
 func NewRenderTreeAsTree() mcp.Tool {
 	tmpl, err := template.New("").Funcs(funcMap).Parse(renderTreeTemplate)
 	if err != nil {
 		panic(err)
 	}
 	return mcp.Tool{
-		Name:        "render_data_as_tree_to_gcs",
-		Description: `This tool renders hierarchical data (like a tree structure) as HTML and uploads it to Google Cloud Storage, returning a public link.`,
+		Name:        "render_data_as_tree_to_minio",
+		Description: `This tool renders hierarchical data (like a tree structure) as HTML and uploads it to Minio, returning a public link. Requires MINIO_* env vars to be set.`,
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -225,7 +243,7 @@ func NewRenderTreeAsTree() mcp.Tool {
 			}
 
 			// Upload and get URL
-			publicURL, err := renderAndUploadToGCS(ctx, buffer)
+			publicURL, err := renderAndUploadToMinio(ctx, buffer)
 			if err != nil {
 				return nil, err // Error already contains details
 			}
@@ -235,15 +253,15 @@ func NewRenderTreeAsTree() mcp.Tool {
 	}
 }
 
-// NewRenderNetworkAsGraph renders a network graph and uploads to GCS.
+// NewRenderNetworkAsGraph renders a network graph and uploads to Minio.
 func NewRenderNetworkAsGraph() mcp.Tool {
 	tmpl, err := template.New("").Funcs(funcMap).Parse(renderGraphTemplate)
 	if err != nil {
 		panic(err)
 	}
 	return mcp.Tool{
-		Name:        "render_network_as_graph_to_gcs",
-		Description: `This tool renders an interconnected network as a force-directed graph in HTML and uploads it to Google Cloud Storage, returning a public link.`,
+		Name:        "render_network_as_graph_to_minio",
+		Description: `This tool renders an interconnected network as a force-directed graph in HTML and uploads it to Minio, returning a public link. Requires MINIO_* env vars to be set.`,
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -279,7 +297,7 @@ func NewRenderNetworkAsGraph() mcp.Tool {
 			}
 
 			// Upload and get URL
-			publicURL, err := renderAndUploadToGCS(ctx, buffer)
+			publicURL, err := renderAndUploadToMinio(ctx, buffer)
 			if err != nil {
 				return nil, err // Error already contains details
 			}
