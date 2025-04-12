@@ -6,6 +6,8 @@ Instead of generating the graph and opening a browser window, this creates the g
 
 Requires an authenticated gcloud cli install with storage APIs enabled.
 
+My apologies to actual devs.
+
 ### Developing the render templates
 
 If you're working on the HTML rendering templates, the templates are stored as the `.html.tmpl` files in the binary.
